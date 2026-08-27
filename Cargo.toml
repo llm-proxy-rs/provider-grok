@@ -1,0 +1,13 @@
+[package]
+name = "provider-grok"
+version = "0.1.0"
+edition = "2021"
+description = "xAI Grok device-flow login and bearer tokens"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
