@@ -1,17 +1,26 @@
-//! xAI Grok OAuth device flow. Tokens in `$XDG_DATA_HOME/provider-grok/auth.json`.
+//! xAI Grok OAuth device flow. Tokens in `$XDG_DATA_HOME/fun/auth.json`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const XAI_DEVICE_URL: &str = "https://auth.x.ai/oauth2/device/code";
 const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
+const MIN_TTL_MS: u64 = 30 * 1000;
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn auth_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -65,14 +74,21 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn data_dir() -> Result<PathBuf> {
+pub fn xdg_data_home() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
         if !dir.is_empty() {
-            return Ok(PathBuf::from(dir).join("provider-grok"));
+            return Ok(PathBuf::from(dir));
         }
     }
     let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/provider-grok"))
+    if home.is_empty() {
+        bail!("HOME is not set");
+    }
+    Ok(PathBuf::from(home).join(".local/share"))
+}
+
+pub fn data_dir() -> Result<PathBuf> {
+    Ok(xdg_data_home()?.join("fun"))
 }
 
 pub fn auth_path() -> Result<PathBuf> {
@@ -80,45 +96,51 @@ pub fn auth_path() -> Result<PathBuf> {
 }
 
 pub fn has_tokens() -> bool {
-    auth_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str::<OAuthTokens>(&t).ok())
-        .is_some()
+    load_tokens_sync().is_some()
+}
+
+fn load_tokens_sync() -> Option<OAuthTokens> {
+    let Ok(path) = auth_path() else {
+        return None;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    serde_json::from_str(&text).ok()
 }
 
 async fn save_tokens(t: &OAuthTokens) -> Result<()> {
     let path = auth_path()?;
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir).await.context("auth dir")?;
-    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    tokio::fs::create_dir_all(dir).await.context("auth dir")?;
     let json = serde_json::to_vec_pretty(t).context("encode auth")?;
+    let tmp = dir.join(format!(".auth.{}.tmp", std::process::id()));
     let mut opts = tokio::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         opts.mode(0o600);
     }
-    let mut f = opts.open(&path).await.context("write auth")?;
-    use tokio::io::AsyncWriteExt;
-    f.write_all(&json).await.context("write auth")?;
-    f.flush().await.context("write auth")?;
-    Ok(())
+    let write = async {
+        let mut f = opts.open(&tmp).await.context("write auth")?;
+        use tokio::io::AsyncWriteExt;
+        f.write_all(&json).await.context("write auth")?;
+        f.flush().await.context("write auth")?;
+        f.sync_all().await.context("write auth")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Err(e) = write.await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .with_context(|| format!("replace {}", path.display()))
 }
 
 async fn load_tokens() -> Option<OAuthTokens> {
-    if let Ok(path) = auth_path() {
-        if let Ok(text) = tokio::fs::read_to_string(&path).await {
-            if let Ok(t) = serde_json::from_str(&text) {
-                return Some(t);
-            }
-        }
-    }
-    // reuse a prior coding-agent login if present
-    let fallback = std::env::var("HOME").ok().map(|h| {
-        PathBuf::from(h).join(".local/share/coding-agent/auth.json")
-    })?;
-    let text = tokio::fs::read_to_string(fallback).await.ok()?;
+    let path = auth_path().ok()?;
+    let text = tokio::fs::read_to_string(&path).await.ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -134,8 +156,14 @@ async fn post_form<T: DeserializeOwned>(url: &str, fields: &[(&str, &str)]) -> R
         .await
         .context("oauth request")?;
     let status = resp.status().as_u16();
-    let v = resp.json().await.context("oauth json")?;
-    Ok((status, v))
+    let text = resp.text().await.context("oauth body")?;
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok((status, v)),
+        Err(e) => {
+            let preview: String = text.chars().take(200).collect();
+            Err(e).context(format!("oauth json (HTTP {status}): {preview}"))
+        }
+    }
 }
 
 fn https_only(raw: &str) -> Result<String> {
@@ -151,6 +179,41 @@ fn https_only(raw: &str) -> Result<String> {
     Ok(raw.into())
 }
 
+#[derive(Debug)]
+struct NeedLogin;
+
+impl fmt::Display for NeedLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not logged in — run login")
+    }
+}
+
+impl std::error::Error for NeedLogin {}
+
+fn need_login() -> anyhow::Error {
+    NeedLogin.into()
+}
+
+fn oauth_fail(kind: &str, status: u16, body: &TokenBody) -> anyhow::Error {
+    let err = body.error.as_deref().unwrap_or("?");
+    let desc = body.error_description.as_deref().unwrap_or("");
+    anyhow!(format!("xAI {kind} failed (HTTP {status}): {err} {desc}").trim_end().to_string())
+}
+
+fn refresh_revoked(body: &TokenBody) -> bool {
+    match body.error.as_deref() {
+        Some("invalid_grant") | Some("invalid_token") => true,
+        _ => {
+            let desc = body
+                .error_description
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            desc.contains("revoked") || desc.contains("invalid refresh")
+        }
+    }
+}
+
 fn tokens_from_body(body: &TokenBody, prev_refresh: Option<&str>) -> Result<OAuthTokens> {
     let access = body
         .access_token
@@ -164,13 +227,53 @@ fn tokens_from_body(body: &TokenBody, prev_refresh: Option<&str>) -> Result<OAut
         .or(prev_refresh)
         .ok_or_else(|| anyhow!("oauth missing refresh_token"))?;
     let lifetime_ms = body.expires_in.unwrap_or(3600).saturating_mul(1000);
+    let skew = REFRESH_SKEW_MS.min(lifetime_ms.saturating_sub(MIN_TTL_MS));
     Ok(OAuthTokens {
         access: access.into(),
         refresh: refresh.into(),
-        expires: now_ms()
-            .saturating_add(lifetime_ms)
-            .saturating_sub(REFRESH_SKEW_MS),
+        expires: now_ms().saturating_add(lifetime_ms).saturating_sub(skew),
     })
+}
+
+fn still_fresh(t: &OAuthTokens) -> bool {
+    now_ms() < t.expires
+}
+
+struct AuthGuard {
+    _mem: tokio::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+
+fn lock_auth_file() -> Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let path = data_dir()?.join("auth.lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).context("auth dir")?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .context("auth lock")?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("auth lock");
+        }
+        return Ok(Some(file));
+    }
+    #[cfg(not(unix))]
+    Ok(None)
+}
+
+async fn lock_auth() -> Result<AuthGuard> {
+    let mem = auth_lock().lock().await;
+    let file = tokio::task::spawn_blocking(lock_auth_file)
+        .await
+        .context("auth lock")??;
+    Ok(AuthGuard { _mem: mem, _file: file })
 }
 
 async fn refresh_tokens(refresh: &str) -> Result<OAuthTokens> {
@@ -184,20 +287,59 @@ async fn refresh_tokens(refresh: &str) -> Result<OAuthTokens> {
     )
     .await?;
     if !(200..300).contains(&status) {
-        bail!("xAI refresh failed (HTTP {status}): {body:?}");
+        if refresh_revoked(&body) {
+            // Another process may have already rotated this grant.
+            if let Some(t) = load_tokens().await {
+                if t.refresh != refresh {
+                    return Ok(t);
+                }
+                // Keep auth.json. A revoked refresh is not the same as "no login".
+                return Err(oauth_fail("refresh", status, &body));
+            }
+            return Err(need_login());
+        }
+        return Err(oauth_fail("refresh", status, &body));
     }
     tokens_from_body(&body, Some(refresh))
 }
 
+pub fn is_not_logged_in(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NeedLogin>().is_some()
+}
+
 /// Access token, refreshing if needed.
 pub async fn bearer() -> Result<String> {
-    let mut t = load_tokens().await.context("not logged in — run login")?;
-    if now_ms() >= t.expires {
-        t = refresh_tokens(&t.refresh)
-            .await
-            .context("refresh xAI token")?;
+    let _guard = lock_auth().await?;
+    let mut t = load_tokens().await.ok_or_else(need_login)?;
+    if !still_fresh(&t) {
+        t = match refresh_tokens(&t.refresh).await {
+            Ok(t) => t,
+            Err(e) if is_not_logged_in(&e) => return Err(e),
+            Err(e) => return Err(e).context("refresh xAI token"),
+        };
         save_tokens(&t).await?;
     }
+    Ok(t.access)
+}
+
+/// Refresh unless `prev_access` was already rotated on disk.
+pub async fn force_refresh(prev_access: Option<&str>) -> Result<String> {
+    let _guard = lock_auth().await?;
+    let t = load_tokens().await.ok_or_else(need_login)?;
+    if prev_access.is_some_and(|prev| prev != t.access) {
+        return Ok(t.access);
+    }
+    if still_fresh(&t) {
+        // A 401 with a still-fresh access token is not expiry. Rotating
+        // here burns the refresh grant and looks like a sudden logout.
+        return Ok(t.access);
+    }
+    let t = match refresh_tokens(&t.refresh).await {
+        Ok(t) => t,
+        Err(e) if is_not_logged_in(&e) => return Err(e),
+        Err(e) => return Err(e).context("refresh xAI token"),
+    };
+    save_tokens(&t).await?;
     Ok(t.access)
 }
 
@@ -243,7 +385,9 @@ pub async fn poll_token(device_code: &str) -> Result<Poll> {
     )
     .await?;
     if (200..300).contains(&st) {
-        save_tokens(&tokens_from_body(&tok, None)?).await?;
+        let tokens = tokens_from_body(&tok, None)?;
+        let _guard = lock_auth().await?;
+        save_tokens(&tokens).await?;
         return Ok(Poll::Done);
     }
     Ok(match tok.error.as_deref() {
@@ -253,13 +397,7 @@ pub async fn poll_token(device_code: &str) -> Result<Poll> {
         }
         Some("access_denied") | Some("authorization_denied") => Poll::Denied,
         Some("expired_token") => Poll::Expired,
-        other => {
-            let desc = tok.error_description.as_deref().unwrap_or("");
-            bail!(
-                "xAI token poll failed (HTTP {st}): {} {desc}",
-                other.unwrap_or("?")
-            )
-        }
+        _ => return Err(oauth_fail("token poll", st, &tok)),
     })
 }
 
@@ -296,11 +434,76 @@ pub async fn login() -> Result<()> {
 }
 
 pub async fn logout() -> Result<bool> {
+    let _guard = lock_auth().await?;
     let path = auth_path()?;
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         tokio::fs::remove_file(&path).await.context("remove auth")?;
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(error: &str, desc: &str) -> TokenBody {
+        TokenBody {
+            access_token: None,
+            refresh_token: None,
+            expires_in: None,
+            error: Some(error.into()),
+            error_description: Some(desc.into()),
+            interval: None,
+        }
+    }
+
+    #[test]
+    fn revoked_refresh_is_need_login() {
+        assert!(refresh_revoked(&body(
+            "invalid_grant",
+            "Refresh token has been revoked"
+        )));
+        assert!(refresh_revoked(&body("invalid_token", "")));
+        assert!(!refresh_revoked(&body("expired_token", "")));
+        assert!(!refresh_revoked(&body("server_error", "try again")));
+        let msg = need_login().to_string();
+        assert_eq!(msg, "not logged in — run login");
+        let wrapped = oauth_fail("refresh", 400, &body("invalid_grant", "revoked"));
+        assert!(wrapped.to_string().contains("invalid_grant"));
+        assert!(!wrapped.to_string().contains("TokenBody"));
+    }
+
+    #[test]
+    fn short_lived_token_stays_fresh() {
+        let body = TokenBody {
+            access_token: Some("a".into()),
+            refresh_token: Some("r".into()),
+            expires_in: Some(60),
+            error: None,
+            error_description: None,
+            interval: None,
+        };
+        let t = tokens_from_body(&body, None).unwrap();
+        assert!(still_fresh(&t), "60s token should not look expired immediately");
+        assert!(t.expires > now_ms());
+        assert!(t.expires - now_ms() >= MIN_TTL_MS - 1);
+    }
+
+    #[test]
+    fn hour_token_refreshes_with_skew() {
+        let body = TokenBody {
+            access_token: Some("a".into()),
+            refresh_token: Some("r".into()),
+            expires_in: Some(3600),
+            error: None,
+            error_description: None,
+            interval: None,
+        };
+        let t = tokens_from_body(&body, None).unwrap();
+        let left = t.expires.saturating_sub(now_ms());
+        assert!(left < 3600 * 1000);
+        assert!(left > 50 * 60 * 1000);
     }
 }
